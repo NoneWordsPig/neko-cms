@@ -1,19 +1,25 @@
 # -*- coding: utf-8 -*-
 """neko ── “聪明山”（raricy.com）上的猫娘机器人。
 
-在老版能力（登录 + 轮询全站评论 + 有人提她名字就回复）之上，这一版加了四件事：
+在老版能力（登录 + 轮询全站评论 + 有人提她名字就回复）之上，这一版加了五件事：
 
   1) 接口对齐现站。老版写的 /auth/login、/blog/spider/* 在站点迁到 Next 之后
      已经全部 404（所以脚本之前其实是跑不起来的）。现站一律走 /api/*，
      契约见站点仓库 docs/comment-bot.md 与 docs/chat-bot.md。
   2) 被提到时，她能读到**那条评论所在的原博客**再回复（长文先概括，避免把上下文撑爆）。
   3) 能读**聊天区**（大区 lobby）的对话，按兴趣决定要不要接话。
-  4) 三条安全约束：
+  4) 能**看懂聊天区里的图片**：附件图、正文内联的 [@10位图片ID]、以及被引用消息里的图，
+     下载后本地缩放（动图抽帧拼成一列）再交给多模态模型；图片只是“上下文”，
+     她不会把图转存、转发或上传回去。
+  5) 三条安全约束：
      · 同一句“提到我”**最多只回一次**：先认领再发送，且认领立刻落盘，
        重启/重复轮询都不会补发（最坏情况是漏回一条，绝不会重复回）；
      · 自己发的评论/消息即使写了自己的名字也不回；其它机器人账号同理
        （BOT_USERNAMES），机器人互刷的链条走不通；
      · 只有人类开口（提到她 / 引用回复她 / 接着她的话说）才会继续对话。
+
+依赖：除 requests / openai / python-dotenv 外，读图还需要 Pillow（`pip install pillow`）。
+没装 Pillow 也能跑，只是自动关掉读图能力（不会崩）。
 
 用法：
     python neko.py                                  # 正常跑（真的会发评论/发消息）
@@ -28,9 +34,12 @@
     NEKO_BOT_USERNAMES    非人类账号（逗号分隔），默认 neko,NebulaFera,Logos
     NEKO_DRY_RUN          1 = 演习模式，不发送
     NEKO_REPLAY_BACKLOG   1 = 演习时把历史评论/聊天也算一遍（仅在演习模式下生效）
+    NEKO_VISION           0 = 关掉读图（默认开）
 """
 
 from sys import exit
+import base64
+import io
 import json
 import os
 import re
@@ -41,6 +50,12 @@ import time
 import requests
 from openai import OpenAI
 from dotenv import load_dotenv
+
+# 读图要用 Pillow（PIL）。没装也不让机器人崩：整个读图能力自动关掉。
+try:
+    from PIL import Image
+except Exception:          # pragma: no cover - 环境问题，不是逻辑分支
+    Image = None
 
 load_dotenv()
 
@@ -97,6 +112,19 @@ COMMENT_REPLY_MAX_CHARS = 2000  # 评论回复的长度保险丝（站点上限�
 CHAT_REPLY_MAX_CHARS = 800      # 聊天回复的长度保险丝
 HANDLED_KEEP = 1000             # 去重表最多保留多少条
 HTTP_TIMEOUT = 20               # 所有站内请求的超时（秒）
+
+# ── 聊天区读图（vision）──
+# 走的是 DeepSeek 的 OpenAI 兼容口：content 里塞 {"type":"image_url"} 的 data URL。
+# 实测 deepseek-chat 能看图（含 GIF 抽帧、长截图 OCR）；deepseek-v4-pro 不行，
+# 所以这里不换模型，继续用 deepseek-chat。
+VISION_ENABLED = os.getenv('NEKO_VISION', '1').strip().lower() not in ('', '0', 'false', 'no')
+IMAGE_MAX_BYTES = 8 * 1024 * 1024      # 站点单图上限 10MB；再大就不看了
+IMAGE_MAX_DIM = 768                    # 长边缩到这个尺寸，单图 prompt 约 200~300 token
+IMAGE_MAX_FRAMES = 4                   # 动图最多抽这么多帧（竖着拼成一列）
+IMAGE_MAX_PER_MESSAGE = 3              # 一条消息最多读几张图
+IMAGE_CACHE_SIZE = 16                  # 同一张图不重复下载/编码
+INLINE_IMAGE_RE = re.compile(r'\[@([A-Za-z0-9]{10})\]')          # 正文内联图床图（10 位）
+IMAGE_URL_RE = re.compile(r'/api/images/([A-Za-z0-9_-]{6,32})/raw')  # 从 URL 里抠图片 id
 
 DRY_RUN = os.getenv('NEKO_DRY_RUN', '').strip().lower() not in ('', '0', 'false', 'no')
 REPLAY_BACKLOG = DRY_RUN and os.getenv('NEKO_REPLAY_BACKLOG', '').strip().lower() not in ('', '0', 'false', 'no')
@@ -298,9 +326,11 @@ def clean_reply(text):
     return text.strip()
 
 
-def _ask_intention(intention, target_text, system_prompt, user_prompt):
+def _ask_intention(intention, target_text, system_prompt, user_prompt, images=None):
+    """意愿打分。带图时把图一起递过去：json_object + 图片实测可用，
+    前提是提示词里出现过 “json” 字样（这也是下面两个提示词都留 EXAMPLE JSON OUTPUT 的原因）。"""
     data = [{'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': user_prompt}]
+            {'role': 'user', 'content': vision_content(user_prompt, images)}]
     content = get_llm_response(data, temperature=0.5, json_output=True)
     real_intention = float(json.loads(content)['intention'])
     print(f'对于[{short(target_text)}]，回复意愿/基础意愿 为 {real_intention}/{intention}')
@@ -323,8 +353,11 @@ EXAMPLE JSON OUTPUT:
     return _ask_intention(intention, comment_text, system_input, comment_text)
 
 
-def get_chat_intention(intention, message_text, context_text):
-    """聊天区版回复意愿：额外带上最近的聊天记录，让“兴趣”判断有上下文。"""
+def get_chat_intention(intention, message_text, context_text, images=None):
+    """聊天区版回复意愿：额外带上最近的聊天记录，让“兴趣”判断有上下文。
+
+    对方发的是图时把图一起递进去 —— 否则“对一张图感不感兴趣”就只能靠掷骰子。
+    """
     system_input = self_introduction
     system_input += f'''现在，你在网站的聊天区（所有人都在的大群）里看大家聊天。下面会给你最近的聊天记录，以及其中最新的一条消息（格式为“用户名: 发送的文本”）。请你给出你的回复意愿。回复意愿是一个0到100的值，表示你有多想对这条消息进行回复。0表示完全拒绝回复，100表示极想回复。你的平均回复意愿是{intention}，也就是说，如果你对话题感兴趣，你应该给出比{intention}更高的值；反之，你应该给出比{intention}更低的值。请将回复意愿的值以json格式输出。
 
@@ -333,8 +366,9 @@ EXAMPLE JSON OUTPUT:
     "intention": {intention*0.9}
 }}
 '''
+    system_input += '如果最新那条消息带了图片，图片会一起给你，请结合图片内容判断想不想接话。'
     user_prompt = f'最近的聊天记录：\n{context_text}\n\n最新的一条：\n{message_text}'
-    return _ask_intention(intention, message_text, system_input, user_prompt)
+    return _ask_intention(intention, message_text, system_input, user_prompt, images)
 
 
 def summarize_blog(title, content):
@@ -362,6 +396,135 @@ def get_blog_text(blog_id):
     if len(content) > BLOG_FULL_MAX_CHARS:
         content = summarize_blog(title, content)
     return title, content
+
+
+# ─────────────────── 聊天区读图：下载 → 压缩 → data URL ───────────────────
+#
+# 图床接口 GET /api/images/:id/raw 对**公开图**不需要登录（私有图对无权者返回 404，
+# 也就是说我们天然只看得到有权限看的图）。站点已经把 SVG 强制成 attachment 下发，
+# 我们这边同样按 mime 白名单 + 尺寸/体积双上限处理，任何一步不对劲就当作“没图”，
+# 绝不因为一张图把主循环搞崩。
+#
+# 图片只在本机内存里过一遍：下载 → 缩放 → base64 → 塞进请求体。不落盘、不回传站上。
+
+_image_cache = {}          # image_id -> data URL（None 表示这张图看不了，别再试）
+
+
+def strip_inline_images(text):
+    """把正文里的 [@10位图片ID] 换成“（图片）”，免得模型把语法原样复述出来。"""
+    return INLINE_IMAGE_RE.sub('（图片）', text or '')
+
+
+def fetch_image_bytes(image_id):
+    """下载一张图床原图，返回 (bytes, mime)；拿不到就返回 (None, '')。"""
+    resp = api_request('GET', f'/api/images/{image_id}/raw')
+    if resp.status_code != 200:
+        print(f'图片 {image_id} 取不到（HTTP {resp.status_code}），这次不看图喵。')
+        return None, ''
+    mime = (resp.headers.get('content-type') or '').split(';')[0].strip().lower()
+    data = resp.content
+    if not data:
+        return None, ''
+    if len(data) > IMAGE_MAX_BYTES:
+        print(f'图片 {image_id} 有 {len(data) // 1024} KB，太大了不看喵。')
+        return None, ''
+    return data, mime
+
+
+def to_vision_data_url(data, mime):
+    """把原图压成模型看得懂的 data URL。
+
+    · 统一转 RGB/JPEG：模型侧对 png/webp/gif 的兼容性没必要赌；
+    · 长边缩到 IMAGE_MAX_DIM，单图 prompt 稳定在 200~300 token；
+    · 动图最多抽 IMAGE_MAX_FRAMES 帧，竖着拼成一列 —— 模型能看出这是“连续几帧”，
+      比只给首帧更不容易把 GIF 误读成一张静止画。
+    """
+    if Image is None:
+        return None
+    if mime == 'image/svg+xml':
+        print('SVG 不是位图，猫猫看不懂，跳过喵。')
+        return None
+    try:
+        im = Image.open(io.BytesIO(data))
+        total = getattr(im, 'n_frames', 1)
+        frames = []
+        for i in range(min(total, IMAGE_MAX_FRAMES)):
+            im.seek(i)
+            frames.append(im.convert('RGB'))
+        if not frames:
+            return None
+        side = max(64, IMAGE_MAX_DIM // max(1, len(frames)))   # 拼起来后仍是 768 见方以内
+        for f in frames:
+            f.thumbnail((side, side))
+        canvas = frames[0]
+        if len(frames) > 1:
+            canvas = Image.new('RGB', (frames[0].width, sum(f.height for f in frames)), 'white')
+            y = 0
+            for f in frames:
+                canvas.paste(f, (0, y))
+                y += f.height
+        buf = io.BytesIO()
+        canvas.save(buf, format='JPEG', quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        print(f'  看图：{mime or "?"} {len(data) // 1024} KB → {canvas.size[0]}x{canvas.size[1]} '
+              f'JPEG {len(buf.getvalue()) // 1024} KB（{len(frames)}/{total} 帧）')
+        return f'data:image/jpeg;base64,{b64}'
+    except Exception as e:
+        print('这张图读不动，跳过喵：', str(e)[:120])
+        return None
+
+
+def image_data_url(image_id):
+    """图片 id → data URL（带缓存；缓存 None 表示试过了、看不了）。"""
+    if not VISION_ENABLED or Image is None or not image_id:
+        return None
+    if image_id in _image_cache:
+        url = _image_cache.pop(image_id)
+        _image_cache[image_id] = url          # 再用到的挪到末尾（简易 LRU）
+        return url
+    data, mime = fetch_image_bytes(image_id)
+    url = to_vision_data_url(data, mime) if data else None
+    _image_cache[image_id] = url
+    while len(_image_cache) > IMAGE_CACHE_SIZE:
+        _image_cache.pop(next(iter(_image_cache)))
+    return url
+
+
+def message_image_ids(message):
+    """一条聊天消息里涉及的图片 id，按出现顺序：附件图 → 正文内联 → 被引用的那张。"""
+    refs = []
+    att = message.get('image') or {}
+    if att.get('id') and not message.get('image_missing'):
+        refs.append(att['id'])
+    refs.extend(INLINE_IMAGE_RE.findall(message.get('content') or ''))
+    quoted = ((message.get('reply') or {}).get('image_url')) or ''
+    hit = IMAGE_URL_RE.search(quoted)
+    if hit:
+        refs.append(hit.group(1))
+    seen, out = set(), []
+    for image_id in refs:
+        if image_id in seen:
+            continue
+        seen.add(image_id)
+        out.append(image_id)
+    return out[:IMAGE_MAX_PER_MESSAGE]
+
+
+def collect_message_images(message):
+    """把上面的 id 变成可以塞进 messages 的 image_url 块，拿不到的自动跳过。"""
+    if not VISION_ENABLED:
+        return []
+    urls = [image_data_url(image_id) for image_id in message_image_ids(message)]
+    return [u for u in urls if u]
+
+
+def vision_content(text, images):
+    """纯文本时保持字符串（老行为不变）；有图时按多模态块拼。"""
+    if not images:
+        return text
+    return [{'type': 'text', 'text': text}] + [
+        {'type': 'image_url', 'image_url': {'url': url}} for url in images
+    ]
 
 
 # ─────────────────────────── 触发判定 ───────────────────────────
@@ -410,14 +573,16 @@ def comment_trigger(cur_comment):
     return 0, 20, '与我无关的回复'
 
 
-def chat_trigger(message, prev_message):
+def chat_trigger(message, prev_message, has_image=False):
     """聊天区触发判定，返回 (probability, intention, direct, addressed, 原因)。
 
     direct    —— 明确冲我来的（回复时要 @ 对方并引用原消息）
     addressed —— 这句话是冲我说的（点名我 / 引用我 / 接着我的话头），
                  这类不受“两条消息最小间隔”限制，避免把提到我的消息静音吃掉。
+    has_image —— 这条消息带了看得懂的图。纯图消息没有正文可提名字，
+                  只可能是“引用我 / 接着我说 / 随缘搭话”这三种情况。
     """
-    content = message.get('content') or ''
+    content = strip_inline_images(message.get('content') or '')
     reply = message.get('reply') or {}
     if is_mentioned(content):
         return 100, 100, True, True, '在聊天区叫到了我'
@@ -426,6 +591,8 @@ def chat_trigger(message, prev_message):
     prev_author = ((prev_message or {}).get('author') or {}).get('username') or ''
     if prev_author == USERNAME:
         return 100, 70, False, True, '我刚说完话，对方接着说话'
+    if has_image:
+        return CHAT_AMBIENT_PROBABILITY, CHAT_AMBIENT_INTENTION, False, False, '发了张图，感兴趣就搭一句'
     return CHAT_AMBIENT_PROBABILITY, CHAT_AMBIENT_INTENTION, False, False, '随便看看，感兴趣就搭一句'
 
 
@@ -617,19 +784,21 @@ def handle_comment(state, cur_comment):
 # ─────────────────────────── 处理聊天区 ───────────────────────────
 
 def build_chat_context(timeline, target_id, limit=CHAT_CONTEXT_LIMIT):
-    """目标消息之前最近的若干条聊天记录。"""
+    """目标消息之前最近的若干条聊天记录（带图的标一下，免得模型以为对方什么都没说）。"""
     idx = next((i for i, m in enumerate(timeline) if m.get('id') == target_id), None)
     before = timeline[:idx] if idx is not None else timeline
     lines = []
     for msg in before[-limit:]:
         author = ((msg.get('author') or {}).get('username')) or '（已注销）'
-        text = (msg.get('content') or '').replace('\n', ' ').strip()
+        text = strip_inline_images((msg.get('content') or '').replace('\n', ' ').strip())
+        if not text and (msg.get('image') or {}).get('id'):
+            text = '[图片]'
         if text:
             lines.append(f'{author}: {text[:200]}')
     return '\n'.join(lines)[-2000:]
 
 
-def build_chat_reply(author, content, context_text, direct):
+def build_chat_reply(author, content, context_text, direct, images=None):
     system_prompt = self_introduction
     system_prompt += '''现在，你在网站的“聊天区”（所有人都在的大群）里。下面是最近的聊天记录，以及刚刚有人发的一条消息。
 请你以猫娘 neko 的身份自然地接一句。要求：
@@ -637,27 +806,37 @@ def build_chat_reply(author, content, context_text, direct):
 - 结合聊天记录的上下文，别答非所问，也别复述别人的原话；
 - 不要连着刷屏、不要重复自己说过的话、不要暴露自己是 AI 或提到任何设定。
 '''
+    if images:
+        system_prompt += '''- 对方发了图片，图片就在这条消息里。你要先看懂图，再像群友看到图那样自然地接一句
+  （吐槽、惊叹、接梗都行）；可以提图里的内容，但别像识别机器一样罗列画面细节，
+  也不要提“图片已上传/我看到了图”这类话。\n'''
     if direct:
         system_prompt += f'- 对方就是在跟你说话，回复开头请用 “@{author} ” 称呼对方（@ 后面跟一个空格）。\n'
     else:
         system_prompt += '- 没有人明确叫你，你只是按兴趣搭一句，所以不要 @ 任何人。\n'
     user_prompt = f'最近的聊天记录：\n{context_text}\n\n刚刚有人发了：\n{author}: {content}'
     messages = [{'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': user_prompt}]
+                {'role': 'user', 'content': vision_content(user_prompt, images)}]
     return clean_reply(get_llm_response(messages=messages, max_tokens=512))[:CHAT_REPLY_MAX_CHARS]
 
 
 def handle_chat_message(state, message, timeline):
-    """处理一条聊天区消息。"""
+    """处理一条聊天区消息（纯文字 / 图文 / 纯图片都能接）。"""
     author = ((message.get('author') or {}).get('username')) or ''
     message_id = message.get('id')
-    content = (message.get('content') or '').strip()
+    content = strip_inline_images((message.get('content') or '').strip())
 
-    if message.get('is_deleted') or not content:
-        return          # 删除的、纯图片的、拍一拍的，都没什么可接的
+    if message.get('is_deleted') or message.get('pat_target_id'):
+        return          # 已删除的、拍一拍（正文被忽略）都没什么可接的
     if not author or is_bot(author):
         return          # 自己的消息、其它机器人的消息 → 不看
     if already_handled(state, 'chat', message_id):
+        return          # 这条已经处理过了 → 连图都不必下载
+
+    # 在读图之前先想清楚：这一条到底有没有东西可接。
+    # （图已经失效 / 私有 / 不是位图时 collect_message_images 会返回空，等同没图）
+    images = collect_message_images(message)
+    if not content and not images:
         return
 
     prev = None
@@ -665,8 +844,8 @@ def handle_chat_message(state, message, timeline):
         if msg.get('id') == message_id:
             prev = timeline[i - 1] if i > 0 else None
             break
-    probability, intention, direct, addressed, reason = chat_trigger(message, prev)
-    label = f'消息[{short(author + ": " + content)}]'
+    probability, intention, direct, addressed, reason = chat_trigger(message, prev, has_image=bool(images))
+    label = f'消息[{short(author + ": " + (content or "（图片）"))}]'
     print(f'—— 聊天区{label}：{reason}（看到概率 {probability}／基础意愿 {intention}）')
     if probability == 0:
         return
@@ -678,9 +857,9 @@ def handle_chat_message(state, message, timeline):
 
     context_text = build_chat_context(timeline, message_id)
     if not roll_intention(probability, intention, label,
-                          lambda base: get_chat_intention(base, label, context_text)):
+                          lambda base: get_chat_intention(base, label, context_text, images)):
         return
-    reply = build_chat_reply(author, content, context_text, direct)
+    reply = build_chat_reply(author, content or '（我发了张图，没配文字）', context_text, direct, images)
     if not reply:
         print('猫猫这次没想出该说什么，先算了喵。')
         return
