@@ -1,0 +1,22 @@
+# 密钥与个人配置：绝不入库
+.env
+
+# 运行时状态（游标 / 去重表 / 频控）
+neko_state.json
+neko_state.json.tmp
+neko_state.dryrun.json
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 与本项目无关的其它机器人：它们各自带自己的账号密码，不混进这个仓库
+莱莉莉.py
+NebulaFera.py
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.history/
+Thumbs.db
+desktop.ini
