@@ -11,7 +11,12 @@
   4) 能**看懂聊天区里的图片**：附件图、正文内联的 [@10位图片ID]、以及被引用消息里的图，
      下载后本地缩放（动图抽帧拼成一列）再交给多模态模型；图片只是“上下文”，
      她不会把图转存、转发或上传回去。
-  5) 三条安全约束：
+  5) 会回**私聊**：私聊里只要是人类发来的（说话 / 发图 / 拍一拍拍到她自己）就必回一条，
+     不走“按兴趣搭话”的那套概率；每个会话单独记游标，历史私聊不回补。
+  6) 有**24 小时的记忆**：她自己参与过的对话（谁说了什么、她回了什么）按天记在
+     neko_memory/YYYY-MM-DD.jsonl，回话时挑跟眼前最相关的几条当背景；超过 24 小时的
+     条目不再读、文件直接删掉 —— 记得住话头，又不会一直攒着。
+  7) 三条安全约束：
      · 同一句“提到我”**最多只回一次**：先认领再发送，且认领立刻落盘，
        重启/重复轮询都不会补发（最坏情况是漏回一条，绝不会重复回）；
      · 自己发的评论/消息即使写了自己的名字也不回；其它机器人账号同理
@@ -89,6 +94,8 @@ LOBBY = 'lobby'                 # 大区频道 id（固定字面量，见 docs/c
 
 POLL_INTERVAL = 5               # 主循环节奏（聊天区按这个间隔轮询，秒）
 COMMENT_POLL_INTERVAL = 30      # 评论轮询周期（秒）。站点只给最近 100 条评论，
+DM_POLL_INTERVAL = 10           # 私聊轮询周期（秒）。/api/chat/poll 是站点最重的接口
+                                # （120 次/分钟的额度），没必要跟着主循环 5 秒一拉
                                 # 间隔别放太长，否则两次轮询之间新增超过 100 条就会漏。
 COMMENT_SEND_COOLDOWN = 15      # 发完一条评论后歇一会儿（老版行为）
 CHAT_SEND_COOLDOWN = 5          # 发完一条聊天消息后歇一会儿
@@ -112,6 +119,8 @@ COMMENT_REPLY_MAX_CHARS = 2000  # 评论回复的长度保险丝（站点上限�
 CHAT_REPLY_MAX_CHARS = 800      # 聊天回复的长度保险丝
 HANDLED_KEEP = 1000             # 去重表最多保留多少条
 HTTP_TIMEOUT = 20               # 所有站内请求的超时（秒）
+DM_MAX_PER_HOUR = 60            # 私聊回复的小时上限（安全阀）。站点硬上限 30 次/分、2000 次/天
+DM_CURSOR_KEEP = 200            # 最多记多少个私聊会话的游标
 
 # ── 聊天区读图（vision）──
 # 走的是 DeepSeek 的 OpenAI 兼容口：content 里塞 {"type":"image_url"} 的 data URL。
@@ -132,6 +141,16 @@ REPLAY_BACKLOG = DRY_RUN and os.getenv('NEKO_REPLAY_BACKLOG', '').strip().lower(
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, 'neko_state.dryrun.json' if DRY_RUN else 'neko_state.json')
 
+# ── 记忆：按日记录，只留 24 小时 ──
+# 记的是**她自己参与过的对话**（对方说了什么 + 她回了什么），按天写成一个 jsonl；
+# 读的时候只认 24 小时以内的条目，更早的条目和整个文件都会清掉。
+# 不做向量库、不做用户画像：这个体量用不上，而且记得越久越像在给站友建档。
+MEMORY_DIR = os.path.join(SCRIPT_DIR, 'neko_memory.dryrun' if DRY_RUN else 'neko_memory')
+MEMORY_TTL = 24 * 3600            # 记忆保鲜期（秒）
+MEMORY_ENTRY_MAX_CHARS = 200      # 单条记录里每段话最多留多少字
+MEMORY_INJECT_MAX_CHARS = 1200    # 一次最多把多少字的记忆塞进提示词
+MEMORY_INJECT_MAX_ITEMS = 12      # 一次最多注入几条记忆
+
 API_KEY = os.getenv('API_KEY') or os.getenv('api_key')   # .env 里写的是小写 api_key
 client = OpenAI(
     api_key=API_KEY,
@@ -141,6 +160,9 @@ client = OpenAI(
 session = requests.Session()
 # 站内直连，不走系统代理：日志里出现过本机代理（127.0.0.1:7897）挂掉直接 ProxyError 崩掉的情况
 session.trust_env = False
+
+# 登录后拿到自己的 user id。私聊里判断“拍一拍是不是拍我”要用到它。
+MY_USER_ID = os.getenv('NEKO_USER_ID', '')
 
 self_introduction = '''你叫neko，你正在访问一个叫做“聪明山”的网站，你在跟网站上的其它成员互动聊天。
 请模拟中文GalGame场景中的猫娘，与其他用户自然地进行中文对话。你可以自由回答问题，但要结合上下文，不要输出与话题无关或重复的内容。
@@ -176,6 +198,8 @@ def login():
     if resp.status_code != 200 or data.get('code') != 200:
         raise RuntimeError(f'登录失败（HTTP {resp.status_code}）：{data}')
     user = data.get('user') or {}
+    global MY_USER_ID
+    MY_USER_ID = user.get('id') or MY_USER_ID
     print(f"登录成功喵：{user.get('username')}（角色 {user.get('role')}）")
     return user
 
@@ -271,25 +295,61 @@ def get_dialog_text(blog_id, comment_id):
     return '\n'.join(lines)[-DIALOG_MAX_CHARS:]
 
 
-def fetch_lobby_context():
-    """聊天区最新一页（按 id 升序）。"""
-    data = get_json(f'/api/chat/channels/{LOBBY}/messages?limit={CHAT_CONTEXT_LIMIT}')
+def fetch_channel_latest(channel_id, limit=CHAT_CONTEXT_LIMIT):
+    """某个频道最新一页（按 id 升序）。大区和私聊用的是同一个接口。"""
+    data = get_json(f'/api/chat/channels/{channel_id}/messages?limit={limit}')
     return (data or {}).get('messages') or []
 
 
-def fetch_lobby_new(after_id):
-    """聊天区 id 大于 after_id 的消息（升序，必要时翻页拉全）。"""
+def fetch_channel_new(channel_id, after_id, limit=CHAT_FETCH_LIMIT, max_pages=5):
+    """某个频道里 id 大于 after_id 的消息（升序，必要时翻页拉全）。
+
+    after_id 传 0 时站点把它当成“没给 after”，于是返回最新一页 —— 对刚出现的
+    私聊会话来说正好是“它到目前为止的全部消息”。
+    """
     out, after = [], after_id
-    for _ in range(5):          # 最多 5 页，防止一次补太多
-        data = get_json(f'/api/chat/channels/{LOBBY}/messages?after={after}&limit={CHAT_FETCH_LIMIT}')
+    for _ in range(max_pages):   # 最多 5 页，防止一次补太多
+        data = get_json(f'/api/chat/channels/{channel_id}/messages?after={after}&limit={limit}')
         page = (data or {}).get('messages') or []
         if not page:
             break
         out.extend(page)
         after = page[-1]['id']
-        if len(page) < CHAT_FETCH_LIMIT:
+        if len(page) < limit:
             break
     return out
+
+
+def fetch_lobby_context():
+    """聊天区最新一页（按 id 升序）。"""
+    return fetch_channel_latest(LOBBY)
+
+
+def fetch_lobby_new(after_id):
+    """聊天区 id 大于 after_id 的消息（升序）。"""
+    return fetch_channel_new(LOBBY, after_id)
+
+
+def fetch_channel_list():
+    """侧栏里的会话列表（含全部私聊）。
+
+    `GET /api/chat/poll` 是聊天页的兜底对账接口，一次给出：每个会话的 kind
+    （lobby / direct）、标题、对端、未读数、以及 **last_message.id** —— 后者正好
+    可以当“这个会话有没有新东西”的便宜信号，省掉每轮对每个会话都拉一遍消息。
+    """
+    data = get_json('/api/chat/poll')
+    return (data or {}).get('channels') or []
+
+
+def mark_channel_read(channel_id, message_id=None):
+    """推进已读游标（缺省 = 频道当前最大 id）。私聊里对方能看到“已读”。"""
+    if DRY_RUN:
+        print(f'[演习] 本来要把 {channel_id} 标记为已读（{message_id or "最新"}）')
+        return
+    payload = {'message_id': message_id} if message_id else {}
+    resp = post_json(f'/api/chat/channels/{channel_id}/read', payload)
+    if not resp_ok(resp):
+        print(f'标记已读失败（HTTP {resp.status_code}）：{resp.text[:120]}')
 
 
 def merge_timeline(*lists):
@@ -614,16 +674,16 @@ def send_comment(blog_id, parent_id, content):
     return False
 
 
-def send_chat_message(content, reply_to=None):
+def send_chat_message(content, reply_to=None, channel=LOBBY):
     if DRY_RUN:
-        print(f'[演习] 本来要发的聊天消息（频道 {LOBBY}，引用 {reply_to}）：{content}')
+        print(f'[演习] 本来要发的聊天消息（频道 {channel}，引用 {reply_to}）：{content}')
         return True
     payload = {'content': content}
     if reply_to:
         payload['reply_to'] = reply_to      # 直接跟我说话时带上引用，跟站上大家的习惯一致
-    resp = post_json(f'/api/chat/channels/{LOBBY}/messages', payload)
+    resp = post_json(f'/api/chat/channels/{channel}/messages', payload)
     if resp_ok(resp):
-        print(f'发送聊天消息成功！内容：[{content}]')
+        print(f'发送聊天消息成功！（频道 {channel}）内容：[{content}]')
         time.sleep(CHAT_SEND_COOLDOWN)
         return True
     print(f'发送聊天消息失败（HTTP {resp.status_code}）：{resp.text[:200]}')
@@ -640,10 +700,13 @@ def default_state():
     return {
         'last_comment_id': None,      # 评论轮询游标（评论 id 是 UUID，只能记“最新那条”）
         'last_chat_id': None,         # 聊天区轮询游标（消息 id 全局自增）
+        'dm_cursors': {},             # 私聊：{频道 id: 已经看到的消息 id}
+        'dm_primed': False,           # 私聊开局水印是否记好（第一次跑不补历史私聊）
         'handled_comments': [],       # 已经回过的评论 id
-        'handled_chat': [],           # 已经回过的聊天消息 id
+        'handled_chat': [],           # 已经回过的聊天消息 id（大区 + 私聊共用，id 全局唯一）
         'comment_reply_times': [],    # 发评论的时刻（做小时限额）
         'chat_reply_times': [],       # 发聊天消息的时刻（做小时限额）
+        'dm_reply_times': [],         # 回私聊的时刻（做小时限额）
         'last_chat_reply_at': 0,      # 上次在聊天区说话的时刻（做最小间隔）
     }
 
@@ -668,9 +731,13 @@ def load_state():
 def trim_state(state):
     state['handled_comments'] = list(state['handled_comments'])[-HANDLED_KEEP:]
     state['handled_chat'] = list(state['handled_chat'])[-HANDLED_KEEP:]
+    cursors = state.get('dm_cursors') or {}
+    if len(cursors) > DM_CURSOR_KEEP:      # 只留游标最大的若干个：最久没动静的会话先忘掉
+        state['dm_cursors'] = dict(sorted(cursors.items(), key=lambda kv: kv[1] or 0)[-DM_CURSOR_KEEP:])
     cutoff = time.time() - 24 * 3600
     state['comment_reply_times'] = [t for t in state['comment_reply_times'] if t > cutoff]
     state['chat_reply_times'] = [t for t in state['chat_reply_times'] if t > cutoff]
+    state['dm_reply_times'] = [t for t in state['dm_reply_times'] if t > cutoff]
 
 
 def save_state(state):
@@ -690,6 +757,11 @@ def handled_key(kind):
     return 'handled_comments' if kind == 'comments' else 'handled_chat'
 
 
+def times_key(kind):
+    """三种通道各自的“回复时刻”列表（做小时限额用）。"""
+    return {'comments': 'comment_reply_times', 'chat': 'chat_reply_times', 'dm': 'dm_reply_times'}[kind]
+
+
 def already_handled(state, kind, trigger_id):
     return trigger_id in state[handled_key(kind)]
 
@@ -703,7 +775,7 @@ def claim_trigger(state, kind, trigger_id):
 
 
 def rate_ok(state, kind, limit_per_hour):
-    key = 'comment_reply_times' if kind == 'comments' else 'chat_reply_times'
+    key = times_key(kind)
     now = time.time()
     used = sum(1 for t in state[key] if t > now - 3600)
     if used >= limit_per_hour:
@@ -713,21 +785,142 @@ def rate_ok(state, kind, limit_per_hour):
 
 
 def note_reply(state, kind):
-    key = 'comment_reply_times' if kind == 'comments' else 'chat_reply_times'
-    state[key].append(time.time())
-    if kind != 'comments':
+    state[times_key(kind)].append(time.time())
+    if kind == 'chat':          # 最小间隔只管大区里“按兴趣搭话”；私聊是有人叫我，不受限
         state['last_chat_reply_at'] = time.time()
     save_state(state)
 
 
+# ───────────────────── 记忆：按日记录，只留 24 小时 ─────────────────────
+#
+# 只有一份很小的“日记”，没有向量库、没有用户画像：
+#   · 记什么：**她自己参与过的对话** —— 谁说了什么、她回了什么；
+#   · 怎么存：neko_memory/YYYY-MM-DD.jsonl，一行一条，追加写（按日分文件）；
+#   · 留多久：读的时候只认 24 小时以内的条目；文件层面只留今天和昨天，更早的整份删掉。
+#
+# 为什么不是“她看到过的一切”：大区一天几百条，全记下来等于把站友发言抄一份到本地，
+# 体积和隐私都不划算；只记“跟她说过话的人”，已经足够让她接得上话头。
+
+def memory_file(when=None):
+    day = time.strftime('%Y-%m-%d', time.localtime(when or time.time()))
+    return os.path.join(MEMORY_DIR, f'{day}.jsonl')
+
+
+def plain(text):
+    """记忆里的一句话：压成一行、留长度上限。"""
+    text = (text or '').replace('\n', ' ').strip()
+    return text if len(text) <= MEMORY_ENTRY_MAX_CHARS else text[:MEMORY_ENTRY_MAX_CHARS] + '…'
+
+
+def remember(kind, who, said, replied, where=''):
+    """记一笔“谁跟我说了什么、我回了什么”。写失败只打日志，不影响回复。"""
+    entry = {
+        't': round(time.time(), 1),
+        'at': time.strftime('%H:%M', time.localtime()),
+        'kind': kind,                    # chat（大区）/ dm（私聊）/ comment（评论区）
+        'where': plain(where)[:60],
+        'who': (who or '')[:40],
+        'said': plain(said),
+        'me': plain(replied),
+    }
+    try:
+        os.makedirs(MEMORY_DIR, exist_ok=True)
+        with open(memory_file(), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    except Exception as e:
+        print('记记忆失败（不影响回复）：', str(e)[:120])
+
+
+def load_memory(ttl=MEMORY_TTL):
+    """读 ttl 以内的记忆，按时间顺序返回（旧的在前）。坏行直接跳过。"""
+    if not os.path.isdir(MEMORY_DIR):
+        return []
+    cutoff = time.time() - ttl
+    entries = []
+    for name in sorted(os.listdir(MEMORY_DIR)):
+        if not name.endswith('.jsonl'):
+            continue
+        try:
+            with open(os.path.join(MEMORY_DIR, name), encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(entry, dict) and (entry.get('t') or 0) > cutoff:
+                        entries.append(entry)
+        except Exception as e:
+            print(f'读记忆文件 {name} 失败（跳过）：', str(e)[:120])
+    entries.sort(key=lambda e: e.get('t') or 0)
+    return entries
+
+
+def memory_context(kind, who, where=''):
+    """挑几条跟当前场景最相关的记忆，拼成一小段给模型看。
+
+    相关度刻意做得很土：先看“是不是同一个人 / 同一个地方”，再看新不新。
+    宁可不相关也别塞太多 —— 记忆只是背景音，不能盖过眼前这句话。
+    """
+    entries = load_memory()
+    if not entries:
+        return ''
+
+    def score(e):
+        s = 0
+        if who and e.get('who') == who:
+            s += 2                      # 同一个人，最重要
+        if where and e.get('where') == where:
+            s += 1                      # 同一个地方（大区 / 同一个私聊）
+        if e.get('kind') == kind:
+            s += 1                      # 同一种通道
+        return s
+
+    entries.sort(key=lambda e: (score(e), e.get('t') or 0), reverse=True)
+    lines, used = [], 0
+    for entry in entries[:MEMORY_INJECT_MAX_ITEMS * 3]:
+        line = (f"[{entry.get('at')}·{entry.get('where') or entry.get('kind')}] "
+                f"{entry.get('who')}：{entry.get('said')}")
+        if entry.get('me'):
+            line += f"（我当时回：{entry.get('me')}）"
+        if len(lines) >= MEMORY_INJECT_MAX_ITEMS or used + len(line) > MEMORY_INJECT_MAX_CHARS:
+            break
+        lines.append(line)
+        used += len(line)
+    if not lines:
+        return ''
+    lines.reverse()                     # 拼回时间顺序：旧的在上
+    return '\n'.join(lines)
+
+
+def prune_memory():
+    """清过期记忆：条目按 24 小时线过滤（读的时候），文件按日期删（只留今天 + 昨天）。"""
+    if not os.path.isdir(MEMORY_DIR):
+        return
+    today = time.strftime('%Y-%m-%d')
+    yesterday = time.strftime('%Y-%m-%d', time.localtime(time.time() - 24 * 3600))
+    for name in os.listdir(MEMORY_DIR):
+        if not name.endswith('.jsonl') or name[:-len('.jsonl')] in (today, yesterday):
+            continue
+        try:
+            os.remove(os.path.join(MEMORY_DIR, name))
+            print(f'记忆过期，已删除：{name}')
+        except Exception as e:
+            print(f'删记忆文件 {name} 失败：', str(e)[:120])
+
+
 # ─────────────────────────── 处理评论 ───────────────────────────
 
-def build_comment_reply(blog_id, dialog_text):
-    """结合**原博客**+对话上下文，生成一句回复（长博客走概括）。"""
+def build_comment_reply(blog_id, dialog_text, memory_text=''):
+    """结合**原博客** + 对话上下文 + 24 小时记忆，生成一句回复（长博客走概括）。"""
     title, blog_text = get_blog_text(blog_id)
     system_prompt = self_introduction
     system_prompt += '现在，你看到了一篇文章以及下面的讨论。请结合文章和上下文，回复讨论中的最后一句话。回复要自然、具体、简短，避免复述原话或生硬地改变话题。'
     user_prompt = f'原博客《{title}》内容：\n{blog_text}\n\n对话记录：\n{dialog_text}'
+    if memory_text:
+        user_prompt += f'\n\n你还记得这些（24 小时内你自己参与过的对话，仅供参考，不一定相关）：\n{memory_text}'
     messages = [{'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': user_prompt}]
     return clean_reply(get_llm_response(messages=messages))[:COMMENT_REPLY_MAX_CHARS]
@@ -772,12 +965,13 @@ def handle_comment(state, cur_comment):
     if dialog_text is None:
         print('在评论树里找不到这条评论（可能已被隐藏），跳过喵。')
         return
-    content = build_comment_reply(blog_id, dialog_text)
+    content = build_comment_reply(blog_id, dialog_text, memory_context('comment', author))
     if not content:
         print('猫猫这次没想出该说什么，先算了喵。')
         return
     claim_trigger(state, 'comments', comment_id)      # 先认领，再发送
     if send_comment(blog_id, comment_id, content):
+        remember('comment', author, text, content)
         note_reply(state, 'comments')
 
 
@@ -798,23 +992,38 @@ def build_chat_context(timeline, target_id, limit=CHAT_CONTEXT_LIMIT):
     return '\n'.join(lines)[-2000:]
 
 
-def build_chat_reply(author, content, context_text, direct, images=None):
+def build_chat_reply(author, content, context_text, direct, images=None, scene='lobby', memory_text=''):
     system_prompt = self_introduction
-    system_prompt += '''现在，你在网站的“聊天区”（所有人都在的大群）里。下面是最近的聊天记录，以及刚刚有人发的一条消息。
+    if scene == 'dm':
+        system_prompt += f'''现在，你在网站的**私聊**里，对面只有「{author}」一个人。下面是你们最近的对话，以及对方刚刚发的一条消息。
+请你以猫娘 neko 的身份自然地回一句。要求：
+- 简短，1~2 句话，像跟熟人一对一说话；不要长篇大论、不要分点列条；
+- 结合上文，别答非所问，也别复述对方的原话；
+- 私聊里就你们两个人，不要 @ 对方、也不要提“群里/大家”这类说法；
+- 不要暴露自己是 AI 或提到任何设定。
+'''
+    else:
+        system_prompt += '''现在，你在网站的“聊天区”（所有人都在的大群）里。下面是最近的聊天记录，以及刚刚有人发的一条消息。
 请你以猫娘 neko 的身份自然地接一句。要求：
 - 简短，1~2 句话，像在群里随手说话，不要长篇大论、不要分点列条；
 - 结合聊天记录的上下文，别答非所问，也别复述别人的原话；
 - 不要连着刷屏、不要重复自己说过的话、不要暴露自己是 AI 或提到任何设定。
 '''
     if images:
-        system_prompt += '''- 对方发了图片，图片就在这条消息里。你要先看懂图，再像群友看到图那样自然地接一句
+        system_prompt += '''- 对方发了图片，图片就在这条消息里。你要先看懂图，再自然地接一句
   （吐槽、惊叹、接梗都行）；可以提图里的内容，但别像识别机器一样罗列画面细节，
   也不要提“图片已上传/我看到了图”这类话。\n'''
-    if direct:
+    if direct and scene == 'dm':
+        system_prompt += '- 对方就是在跟你说话（私聊本来就冲你来的），直接回，不要 @ 任何人，也不要引用原话。\n'
+    elif direct:
         system_prompt += f'- 对方就是在跟你说话，回复开头请用 “@{author} ” 称呼对方（@ 后面跟一个空格）。\n'
     else:
         system_prompt += '- 没有人明确叫你，你只是按兴趣搭一句，所以不要 @ 任何人。\n'
-    user_prompt = f'最近的聊天记录：\n{context_text}\n\n刚刚有人发了：\n{author}: {content}'
+    head = '你们最近的对话' if scene == 'dm' else '最近的聊天记录'
+    user_prompt = f'{head}：\n{context_text}\n\n刚刚有人发了：\n{author}: {content}'
+    if memory_text:
+        user_prompt = (f'你还记得这些（24 小时内你自己参与过的对话，仅供参考，不一定相关）：\n'
+                       f'{memory_text}\n\n{user_prompt}')
     messages = [{'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': vision_content(user_prompt, images)}]
     return clean_reply(get_llm_response(messages=messages, max_tokens=512))[:CHAT_REPLY_MAX_CHARS]
@@ -826,7 +1035,7 @@ def handle_chat_message(state, message, timeline):
     message_id = message.get('id')
     content = strip_inline_images((message.get('content') or '').strip())
 
-    if message.get('is_deleted') or message.get('pat_target_id'):
+    if message.get('is_deleted') or message.get('pat'):
         return          # 已删除的、拍一拍（正文被忽略）都没什么可接的
     if not author or is_bot(author):
         return          # 自己的消息、其它机器人的消息 → 不看
@@ -859,12 +1068,14 @@ def handle_chat_message(state, message, timeline):
     if not roll_intention(probability, intention, label,
                           lambda base: get_chat_intention(base, label, context_text, images)):
         return
-    reply = build_chat_reply(author, content or '（我发了张图，没配文字）', context_text, direct, images)
+    reply = build_chat_reply(author, content or '（我发了张图，没配文字）', context_text, direct,
+                             images, memory_text=memory_context('chat', author, '大区'))
     if not reply:
         print('猫猫这次没想出该说什么，先算了喵。')
         return
     claim_trigger(state, 'chat', message_id)          # 先认领，再发送
     if send_chat_message(reply, reply_to=message_id if direct else None):
+        remember('chat', author, content or '（图片）', reply, where='大区')
         note_reply(state, 'chat')
 
 
@@ -910,6 +1121,112 @@ def poll_comments(state):
     save_state(state)
 
 
+# ─────────────────────────── 处理私聊 ───────────────────────────
+#
+# 私聊和大区共用同一套“拉消息 / 发消息”接口，只有两点不同：
+#   · 会话是 direct，频道 id 是 UUID（大区是字面量 lobby）；
+#   · 一对一，所以不用 @、也不用引用 —— 说话本来就是冲对方说的。
+#
+# 触发策略：**私聊里只要是人类发来的，一律回一条**，不走大区那套
+# “看到概率 × 回复意愿”的掷骰子；发图、拍一拍拍到我，同样算“被点到了”。
+
+def dm_trigger(message, channel):
+    """私聊触发判定，返回 (要不要回, 原因)。"""
+    pat = message.get('pat') or {}
+    if pat:
+        if pat.get('target_id') == MY_USER_ID:
+            return True, '私聊里拍了拍我'
+        return False, '拍的是别人'
+    return True, '私聊里对我说话'
+
+
+def handle_direct_message(state, message, channel, timeline):
+    """处理一条私聊消息：只要是人类发的（说话 / 发图 / 拍我），回一条。"""
+    author = ((message.get('author') or {}).get('username')) or ''
+    message_id = message.get('id')
+    content = strip_inline_images((message.get('content') or '').strip())
+
+    if message.get('is_deleted') or not author or is_bot(author):
+        return
+    if already_handled(state, 'dm', message_id):
+        return
+
+    should, reason = dm_trigger(message, channel)
+    if not should:
+        return
+    if message.get('pat'):
+        images, content = [], (content or '（对方拍了拍我）')
+    else:
+        images = collect_message_images(message)
+        if not content and not images:
+            return
+    if not rate_ok(state, 'dm', DM_MAX_PER_HOUR):
+        return
+
+    title = channel.get('title') or channel.get('id')
+    label = f'私聊[{title}] {author}: {content or "（图片）"}'
+    print(f'—— {label}：{reason}（私聊一律接话，不掷骰子）')
+    context_text = build_chat_context(timeline, message_id)
+    reply = build_chat_reply(author, content or '（我发了张图，没配文字）', context_text, True,
+                             images, scene='dm', memory_text=memory_context('dm', author, title))
+    if not reply:
+        print('猫猫这次没想出该说什么，先算了喵。')
+        return
+    claim_trigger(state, 'dm', message_id)          # 先认领，再发送
+    if send_chat_message(reply, channel=channel['id']):
+        remember('dm', author, content or '（图片）', reply, where=title)
+        note_reply(state, 'dm')
+
+
+def poll_direct(state):
+    """私聊轮询：先看会话列表，只有真出新消息才去拉那个会话，再逐条回。"""
+    try:
+        channels = fetch_channel_list()
+    except Exception as e:
+        print('拉会话列表失败，这轮先跳过私聊喵：', str(e)[:120])
+        return
+    directs = [c for c in channels if c.get('kind') == 'direct' and c.get('id')]
+
+    if not state.get('dm_primed'):
+        # 第一轮：把现有会话的位置记下来，历史私聊不回补
+        # （免得开机那一瞬间把几天前的私聊一口气全回了）
+        for channel in directs:
+            state['dm_cursors'][channel['id']] = ((channel.get('last_message') or {}).get('id')) or 0
+        state['dm_primed'] = True
+        print(f'第一次跑：先记住 {len(directs)} 个私聊会话的位置，历史私聊不回补喵。')
+        if REPLAY_BACKLOG:
+            print('演习模式：把每个私聊会话最近一页也拿来看一遍喵。')
+            for channel in directs:
+                page = fetch_channel_latest(channel['id'])
+                for message in page:
+                    handle_direct_message(state, message, channel, page)
+        save_state(state)
+        return
+
+    for channel in directs:
+        channel_id = channel['id']
+        cursor = state['dm_cursors'].get(channel_id)
+        last_id = ((channel.get('last_message') or {}).get('id')) or 0
+        if cursor is None:
+            # 跑着跑着才冒出来的会话 = 有人刚刚私聊我：从它第一条开始看
+            print(f"发现新私聊会话《{channel.get('title')}》，从第一条开始看喵。")
+            cursor = 0
+        if last_id <= cursor:
+            continue              # 列表里的 last_message 就说明没有新东西，省一次请求
+        new_messages = fetch_channel_new(channel_id, cursor)
+        if not new_messages:
+            continue
+        timeline = merge_timeline(fetch_channel_latest(channel_id), new_messages)
+        for message in new_messages:
+            handle_direct_message(state, message, channel, timeline)
+        state['dm_cursors'][channel_id] = max([m['id'] for m in new_messages] + [cursor])
+        save_state(state)
+        try:
+            mark_channel_read(channel_id)     # 回完推已读，对方那边才不会一直挂着未读
+        except Exception as e:
+            print('标记已读失败：', str(e)[:120])
+
+
 def poll_chat(state):
     context = fetch_lobby_context()
     if state['last_chat_id'] is None:
@@ -951,7 +1268,12 @@ def main():
 
     login()
     state = load_state()
+    prune_memory()                 # 开机先清一次过期记忆（只留最近 24 小时）
+    print(f'记忆：按日记录在 {MEMORY_DIR}，只读最近 {MEMORY_TTL // 3600} 小时，'
+          f'已载入 {len(load_memory())} 条')
     next_comment_poll = 0.0        # 第一轮先立刻拉一次评论
+    next_dm_poll = 0.0             # 私聊也先立刻看一眼
+    next_memory_prune = time.time() + 3600
     while True:
         try:
             now = time.time()
@@ -959,6 +1281,12 @@ def main():
                 next_comment_poll = now + COMMENT_POLL_INTERVAL
                 poll_comments(state)
             poll_chat(state)
+            if now >= next_dm_poll:
+                next_dm_poll = now + DM_POLL_INTERVAL
+                poll_direct(state)
+            if now >= next_memory_prune:
+                next_memory_prune = now + 3600
+                prune_memory()
         except KeyboardInterrupt:
             print('优雅退出中…………')
             save_state(state)
