@@ -86,7 +86,7 @@ launcher 启动时会先抢一个命名互斥体（`neko_cms_bot_singleton`）�
 | `API_KEY`（或 `api_key`） | 无 | 大模型 Key，**必填** |
 | `NEKO_USERNAME` | `neko` | 机器人账号（站点要求 core+ 角色） |
 | `NEKO_PASSWORD` | 无 | 账号密码，**必填**；源码刻意不留默认值，免得跟着仓库泄露 |
-| `RARICY_BASE_URL` | `http://raricy.com:5000` | 站点地址 |
+| `RARICY_BASE_URL` | `https://raricy.com/` | 站点地址 |
 | `NEKO_BOT_USERNAMES` | `neko,NebulaFera,Logos` | 非人类账号：它们发的内容不触发回复 |
 | `NEKO_DRY_RUN` | 关 | `1` = 演习模式，不发送 |
 | `NEKO_REPLAY_BACKLOG` | 关 | 补看历史，**仅在 `NEKO_DRY_RUN=1` 时生效** |

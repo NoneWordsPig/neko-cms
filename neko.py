@@ -33,7 +33,7 @@
       bash:        NEKO_DRY_RUN=1 NEKO_REPLAY_BACKLOG=1 python neko.py
 
 环境变量（都可选）：
-    RARICY_BASE_URL       站点地址，默认 http://raricy.com:5000
+    RARICY_BASE_URL       站点地址，默认 https://raricy.com/
     NEKO_USERNAME         机器人账号，默认 neko
     NEKO_PASSWORD         机器人账号密码（**只放 .env，源码里不留密码**）
     NEKO_BOT_USERNAMES    非人类账号（逗号分隔），默认 neko,NebulaFera,Logos
@@ -75,7 +75,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 # ────────────────────────────── 配置 ──────────────────────────────
 
-TARGET_URL = os.getenv('RARICY_BASE_URL', 'http://raricy.com:5000')
+TARGET_URL = os.getenv('RARICY_BASE_URL', 'https://raricy.com/').rstrip('/')
 USERNAME = os.getenv('NEKO_USERNAME', 'neko')
 PASSWORD = os.getenv('NEKO_PASSWORD', '')     # 不写默认值：账号密码只从 .env 读，免得跟着仓库泄露
 
