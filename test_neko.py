@@ -1,4 +1,7 @@
 import time
+import json
+import os
+import shutil
 import unittest
 from unittest.mock import patch
 
@@ -40,10 +43,10 @@ class ChatTriggerTests(unittest.TestCase):
 
         with patch.object(neko, 'collect_message_images', return_value=[]), \
                 patch.object(neko, 'build_chat_reply', return_value='@alice 能，刚看到。'), \
-                patch.object(neko, 'memory_context', return_value=''), \
+                patch.object(neko, 'vector_memory_context', return_value=''), \
                 patch.object(neko, 'claim_trigger', side_effect=lambda *_: events.append('claim')) as claim, \
                 patch.object(neko, 'send_chat_message', side_effect=lambda *_a, **_k: events.append('send') or True) as send, \
-                patch.object(neko, 'remember'), patch.object(neko, 'note_reply'):
+                patch.object(neko, 'note_reply'):
             neko.handle_chat_message(state, message, [message])
 
         claim.assert_called_once_with(state, 'chat', 3)
@@ -105,12 +108,23 @@ class ChatPollingTests(unittest.TestCase):
 
         with patch.object(neko, 'fetch_lobby_context', return_value=[newer_context]), \
                 patch.object(neko, 'fetch_lobby_new', return_value=[ambient, direct]), \
+                patch.object(neko, 'archive_public_message'), \
                 patch.object(neko, 'handle_chat_message', side_effect=lambda _s, m, _t: handled.append(m['id'])), \
                 patch.object(neko, 'save_state'):
             neko.poll_chat(state)
 
         self.assertEqual([102, 101], handled)
         self.assertEqual(102, state['last_chat_id'])
+
+    def test_private_history_walks_backwards_until_the_first_message(self):
+        latest = [chat_message(i, 'alice', str(i)) for i in range(101, 201)]
+        older = [chat_message(i, 'alice', str(i)) for i in range(1, 101)]
+
+        with patch.object(neko, 'fetch_channel_latest', return_value=latest), \
+                patch.object(neko, 'get_json', side_effect=[{'messages': older}, {'messages': []}]):
+            history = neko.fetch_channel_history('dm-alice')
+
+        self.assertEqual(list(range(1, 201)), [message['id'] for message in history])
 
 
 class ReplyFormattingTests(unittest.TestCase):
@@ -127,6 +141,83 @@ class ReplyFormattingTests(unittest.TestCase):
             reply={'author_name': 'bob', 'content': '前一个具体问题'},
         )
         self.assertEqual('这条消息引用了 bob：前一个具体问题', neko.build_reply_reference(message))
+
+
+class VectorMemoryTests(unittest.TestCase):
+    def setUp(self):
+        self.old_memory_db_dir = neko.MEMORY_DB_DIR
+        self.old_memory_dir = neko.MEMORY_DIR
+        self.test_memory_db_dir = os.path.join(neko.SCRIPT_DIR, '_test_memory_db')
+        self.test_memory_json_dir = os.path.join(neko.SCRIPT_DIR, '_test_memory_json')
+        shutil.rmtree(self.test_memory_db_dir, ignore_errors=True)
+        shutil.rmtree(self.test_memory_json_dir, ignore_errors=True)
+        os.makedirs(self.test_memory_db_dir, exist_ok=True)
+        os.makedirs(self.test_memory_json_dir, exist_ok=True)
+        neko.MEMORY_DB_DIR = self.test_memory_db_dir
+        neko.MEMORY_DIR = self.test_memory_json_dir
+
+    def tearDown(self):
+        neko.MEMORY_DB_DIR = self.old_memory_db_dir
+        neko.MEMORY_DIR = self.old_memory_dir
+        shutil.rmtree(self.test_memory_db_dir, ignore_errors=True)
+        shutil.rmtree(self.test_memory_json_dir, ignore_errors=True)
+
+    def test_private_databases_are_separated_per_person_and_keep_full_text(self):
+        long_text = '猫' * 1000
+        neko._store_memory(neko._private_memory_path('Alice'), 'chat:1', 'dm', long_text,
+                           actor_name='Alice', owner_name='Alice')
+
+        alice_rows = neko._search_memory(neko._private_memory_path('Alice'), '猫')
+        bob_rows = neko._search_memory(neko._private_memory_path('Bob'), '猫')
+
+        self.assertEqual(long_text, alice_rows[0][5])
+        self.assertEqual([], bob_rows)
+        self.assertNotEqual(neko._private_memory_path('Alice'), neko._private_memory_path('Bob'))
+
+    def test_semantic_similarity_stays_stronger_than_small_recent_bonus(self):
+        path = neko._public_memory_path()
+        neko._store_memory(path, 'old', 'lobby', '我今天想学习微积分和导数',
+                           created_at=time.time() - 7 * 86400)
+        neko._store_memory(path, 'recent', 'lobby', '晚饭吃了一碗面',
+                           created_at=time.time())
+
+        rows = neko._search_memory(path, '微积分导数怎么学')
+
+        self.assertEqual('我今天想学习微积分和导数', rows[0][5])
+
+    def test_blog_archive_primes_without_backfill_then_stores_new_blog(self):
+        state = neko.default_state()
+        old_blog = {'id': 'old', 'title': '旧文', 'description': '旧引言', 'author': 'alice'}
+        new_blog = {'id': 'new', 'title': '新文', 'description': '新引言', 'author': 'bob'}
+
+        with patch.object(neko, 'fetch_recent_blogs', return_value=[old_blog]), \
+                patch.object(neko, 'save_state'):
+            neko.poll_public_blogs(state)
+        self.assertFalse(neko._search_memory(neko._public_memory_path(), '旧文'))
+
+        with patch.object(neko, 'fetch_recent_blogs', return_value=[new_blog, old_blog]), \
+                patch.object(neko, 'save_state'):
+            neko.poll_public_blogs(state)
+        rows = neko._search_memory(neko._public_memory_path(), '新文新引言')
+        self.assertEqual('博客《新文》，作者 bob：新引言', rows[0][5])
+
+    def test_legacy_migration_imports_only_private_history(self):
+        entries = [
+            {'t': time.time() - 100, 'kind': 'dm', 'where': '私聊', 'who': 'Alice',
+             'said': '我喜欢星星', 'me': '我记住啦'},
+            {'t': time.time() - 50, 'kind': 'chat', 'where': '大区', 'who': 'Bob',
+             'said': '这是旧大区内容', 'me': '旧回复'},
+        ]
+        archive = os.path.join(self.test_memory_json_dir, '2026-09-16.jsonl')
+        with open(archive, 'w', encoding='utf-8') as file:
+            for entry in entries:
+                file.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+        neko.migrate_legacy_private_memory()
+
+        private_rows = neko._search_memory(neko._private_memory_path('Alice'), '星星')
+        self.assertIn('Alice: 我喜欢星星', private_rows[0][5])
+        self.assertFalse(os.path.exists(neko._public_memory_path()))
 
 
 if __name__ == '__main__':

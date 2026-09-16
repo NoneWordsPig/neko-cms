@@ -9,6 +9,10 @@ neko_state.dryrun.json
 # 长期记忆归档（按日记录的对话，只留本机）
 neko_memory/
 neko_memory.dryrun/
+neko_memory_db/
+neko_memory_db.dryrun/
+_test_memory_db/
+_test_memory_json/
 
 # Python 缓存
 __pycache__/
