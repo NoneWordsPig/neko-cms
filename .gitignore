@@ -6,7 +6,7 @@ neko_state.json
 neko_state.json.tmp
 neko_state.dryrun.json
 
-# 24 小时记忆（按日记录的对话，只留本机）
+# 长期记忆归档（按日记录的对话，只留本机）
 neko_memory/
 neko_memory.dryrun/
 
