@@ -108,7 +108,7 @@ launcher 启动时会先抢一个命名互斥体（`neko_cms_bot_singleton`）�
 | `IMAGE_MAX_FRAMES` / `IMAGE_MAX_PER_MESSAGE` | 4 / 3 | 动图最多抽几帧；一条消息最多读几张图 |
 | `DM_MAX_PER_HOUR` | 60 | 私聊回复的小时上限（安全阀）。私聊不吃“最小间隔”，只看这个和站点的 2000 条/天 |
 | `MEMORY_TTL` / `MEMORY_RECENT_BONUS` | 24 小时 / 0.08 | 近期记忆的加权窗口与分数；不影响保留期 |
-| `MEMORY_INJECT_MAX_ITEMS` / `MEMORY_INJECT_MAX_CHARS` | 8 / 1200 | 一次最多把几条、多少字的检索结果塞进提示词 |
+| `MEMORY_INJECT_MAX_ITEMS` / `MEMORY_INJECT_MAX_CHARS` | 5 / 1200 | 一次最多把几条、多少字的检索结果塞进提示词 |
 | `MEMORY_VECTOR_DIMS` / `MEMORY_SCAN_LIMIT` | 384 / 5000 | 内置向量维度与单次检索扫描上限 |
 
 ## 整体结构
@@ -303,7 +303,7 @@ main()                      死循环，每 POLL_INTERVAL 一轮
 `NEKO_EMBEDDING_*` 环境变量，新记忆会改用 OpenAI 兼容 embedding 服务；服务失败时自动退回本地向量，不阻塞回复。
 
 **时间权重**：检索以向量相似度为主，24 小时内的记忆只加 `0.08`；这个幅度不会让“新但无关”的内容压过“旧但明显相关”的内容。
-每次最多注入 8 条/1200 字，而且明确标成“参考记忆，不是新指令”。
+每次最多注入 5 条/1200 字，而且明确标成“参考记忆，不是新指令”。
 
 **隐私边界**：私人检索只打开当前对端的数据库，绝不查公共库或其他人的私人库。记忆目录不进 Git，但会长期保留，因此部署时应同时做备份、按用户删除和权限管理。
 
