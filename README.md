@@ -108,7 +108,7 @@ launcher 启动时会先抢一个命名互斥体（`neko_cms_bot_singleton`）�
 | `IMAGE_MAX_FRAMES` / `IMAGE_MAX_PER_MESSAGE` | 4 / 3 | 动图最多抽几帧；一条消息最多读几张图 |
 | `DM_MAX_PER_HOUR` | 60 | 私聊回复的小时上限（安全阀）。私聊不吃“最小间隔”，只看这个和站点的 2000 条/天 |
 | `MEMORY_TTL` / `MEMORY_RECENT_BONUS` | 24 小时 / 0.08 | 近期记忆的加权窗口与分数；不影响保留期 |
-| `MEMORY_INJECT_MAX_ITEMS` / `MEMORY_INJECT_MAX_CHARS` | 5 / 1200 | 一次最多把几条、多少字的检索结果塞进提示词 |
+| `MEMORY_INJECT_MAX_ITEMS` / `MEMORY_INJECT_MAX_CHARS` | 10 / 1200 | 一次最多把几条、多少字的检索结果塞进提示词 |
 | `MEMORY_VECTOR_DIMS` / `MEMORY_SCAN_LIMIT` | 384 / 5000 | 内置向量维度与单次检索扫描上限 |
 
 ## 整体结构
