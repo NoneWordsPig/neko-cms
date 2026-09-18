@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import neko
+from neko_bot.memory import ebbinghaus_retention
 
 
 def chat_message(message_id, author, content='', **extra):
@@ -239,7 +240,7 @@ class VectorMemoryTests(unittest.TestCase):
         self.assertEqual([], bob_rows)
         self.assertNotEqual(neko._private_memory_path('Alice'), neko._private_memory_path('Bob'))
 
-    def test_semantic_similarity_stays_stronger_than_small_recent_bonus(self):
+    def test_semantic_similarity_stays_stronger_than_recency_decay(self):
         path = neko._public_memory_path()
         neko._store_memory(path, 'old', 'lobby', '我今天想学习微积分和导数',
                            created_at=time.time() - 7 * 86400)
@@ -249,6 +250,32 @@ class VectorMemoryTests(unittest.TestCase):
         rows = neko._search_memory(path, '微积分导数怎么学')
 
         self.assertEqual('我今天想学习微积分和导数', rows[0][5])
+
+    def test_ebbinghaus_retention_is_exponential_and_monotonic(self):
+        stability = 30 * 86400
+
+        self.assertAlmostEqual(1.0, ebbinghaus_retention(0, stability))
+        self.assertAlmostEqual(1 / 2.718281828459045,
+                               ebbinghaus_retention(stability, stability), places=7)
+        self.assertGreater(
+            ebbinghaus_retention(7 * 86400, stability),
+            ebbinghaus_retention(30 * 86400, stability),
+        )
+
+    def test_equal_vector_matches_are_ranked_by_forgetting_curve(self):
+        path = neko._public_memory_path()
+        now = time.time()
+        text = '周末一起去看星星和月亮'
+        neko._store_memory(path, 'old-same-topic', 'lobby', text,
+                           created_at=now - neko.MEMORY_STABILITY)
+        neko._store_memory(path, 'new-same-topic', 'lobby', text,
+                           created_at=now)
+
+        rows = neko._search_memory(path, text)
+
+        self.assertEqual([text, text], [row[5] for row in rows[:2]])
+        self.assertGreater(rows[0][0], rows[1][0])
+        self.assertAlmostEqual(2.718281828459045, rows[0][0] / rows[1][0], delta=0.02)
 
     def test_blog_archive_primes_without_backfill_then_stores_new_blog(self):
         state = neko.default_state()
