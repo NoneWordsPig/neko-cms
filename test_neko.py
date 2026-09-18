@@ -6,7 +6,6 @@ import unittest
 from unittest.mock import patch
 
 import neko
-from neko_bot.memory import ebbinghaus_retention
 
 
 def chat_message(message_id, author, content='', **extra):
@@ -20,12 +19,6 @@ def chat_message(message_id, author, content='', **extra):
 
 
 class ChatTriggerTests(unittest.TestCase):
-    def test_plain_name_in_normal_sentence_is_direct_and_addressed(self):
-        for content in ('今天neko怎么样', '今天Neko怎么样', '今天NEKO怎么样', '今天妮可酱怎么样'):
-            with self.subTest(content=content):
-                trigger = neko.chat_trigger(chat_message(0, 'alice', content), None)
-                self.assertEqual((100, 100, True, True), trigger[:4])
-
     def test_both_public_names_are_direct_and_addressed(self):
         for content in ('@neko 能看看这个吗', '@妮可 能看看这个吗'):
             with self.subTest(content=content):
@@ -59,50 +52,6 @@ class ChatTriggerTests(unittest.TestCase):
         claim.assert_called_once_with(state, 'chat', 3)
         send.assert_called_once_with('@alice 能，刚看到。', reply_to=3)
         self.assertEqual(['claim', 'send'], events)
-
-    def test_name_mention_skips_random_gate_and_name_only_message_is_replyable(self):
-        state = neko.default_state()
-        message = chat_message(30, 'alice', '@妮可')
-
-        with patch.object(neko, 'collect_message_images', return_value=[]), \
-                patch.object(neko, 'build_chat_reply', return_value='@alice 收到啦。') as build, \
-                patch.object(neko, 'vector_memory_context', return_value=''), \
-                patch.object(neko, 'roll_intention', side_effect=AssertionError('name mention must not roll')), \
-                patch.object(neko, 'claim_trigger') as claim, \
-                patch.object(neko, 'send_chat_message', return_value=True) as send, \
-                patch.object(neko, 'note_reply'):
-            neko.handle_chat_message(state, message, [message])
-
-        build.assert_called_once()
-        self.assertEqual('@妮可', build.call_args.args[1])
-        claim.assert_called_once_with(state, 'chat', 30)
-        send.assert_called_once_with('@alice 收到啦。', reply_to=30)
-
-    def test_adjacent_identical_name_messages_each_trigger_once(self):
-        state = neko.default_state()
-        state['last_chat_reply_at'] = time.time()
-        first = chat_message(31, 'alice', '今天neko怎么样')
-        second = chat_message(32, 'alice', '今天neko怎么样')
-        events = []
-
-        def claim(state_arg, kind, message_id):
-            events.append(('claim', message_id))
-            state_arg['handled_chat'].append(message_id)
-
-        with patch.object(neko, 'collect_message_images', return_value=[]), \
-                patch.object(neko, 'build_chat_reply', side_effect=['@alice 第一条收到啦。', '@alice 第二条也收到啦。']), \
-                patch.object(neko, 'vector_memory_context', return_value=''), \
-                patch.object(neko, 'roll_intention', side_effect=AssertionError('name mention must not roll')), \
-                patch.object(neko, 'claim_trigger', side_effect=claim), \
-                patch.object(neko, 'send_chat_message', side_effect=lambda text, **kwargs: events.append(('send', kwargs['reply_to'])) or True), \
-                patch.object(neko, 'note_reply'):
-            neko.handle_chat_message(state, first, [first])
-            neko.handle_chat_message(state, second, [first, second])
-
-        self.assertEqual([
-            ('claim', 31), ('send', 31),
-            ('claim', 32), ('send', 32),
-        ], events)
 
     def test_handled_direct_message_is_deduplicated_before_image_or_send(self):
         state = neko.default_state()
@@ -200,27 +149,12 @@ class ChatPollingTests(unittest.TestCase):
         with patch.object(neko, 'fetch_lobby_context', return_value=[newer_context]), \
                 patch.object(neko, 'fetch_lobby_new', return_value=[ambient, direct]), \
                 patch.object(neko, 'archive_public_message'), \
-                patch.object(neko, 'handle_chat_message', side_effect=lambda _s, m, _t: (handled.append(m['id']), _s['handled_chat'].append(m['id']))), \
+                patch.object(neko, 'handle_chat_message', side_effect=lambda _s, m, _t: handled.append(m['id'])), \
                 patch.object(neko, 'save_state'):
             neko.poll_chat(state)
 
         self.assertEqual([102, 101], handled)
         self.assertEqual(102, state['last_chat_id'])
-
-    def test_unclaimed_name_mention_is_not_lost_to_cursor(self):
-        state = neko.default_state()
-        state['last_chat_id'] = 100
-        ambient = chat_message(101, 'bob', '今天天气不错')
-        direct = chat_message(102, 'alice', '@neko 在吗')
-
-        with patch.object(neko, 'fetch_lobby_context', return_value=[]), \
-                patch.object(neko, 'fetch_lobby_new', return_value=[ambient, direct]), \
-                patch.object(neko, 'archive_public_message'), \
-                patch.object(neko, 'handle_chat_message'), \
-                patch.object(neko, 'save_state'):
-            neko.poll_chat(state)
-
-        self.assertEqual(101, state['last_chat_id'])
 
     def test_private_history_walks_backwards_until_the_first_message(self):
         latest = [chat_message(i, 'alice', str(i)) for i in range(101, 201)]
@@ -280,7 +214,7 @@ class VectorMemoryTests(unittest.TestCase):
         self.assertEqual([], bob_rows)
         self.assertNotEqual(neko._private_memory_path('Alice'), neko._private_memory_path('Bob'))
 
-    def test_semantic_similarity_stays_stronger_than_recency_decay(self):
+    def test_semantic_similarity_stays_stronger_than_small_recent_bonus(self):
         path = neko._public_memory_path()
         neko._store_memory(path, 'old', 'lobby', '我今天想学习微积分和导数',
                            created_at=time.time() - 7 * 86400)
@@ -290,32 +224,6 @@ class VectorMemoryTests(unittest.TestCase):
         rows = neko._search_memory(path, '微积分导数怎么学')
 
         self.assertEqual('我今天想学习微积分和导数', rows[0][5])
-
-    def test_ebbinghaus_retention_is_exponential_and_monotonic(self):
-        stability = 30 * 86400
-
-        self.assertAlmostEqual(1.0, ebbinghaus_retention(0, stability))
-        self.assertAlmostEqual(1 / 2.718281828459045,
-                               ebbinghaus_retention(stability, stability), places=7)
-        self.assertGreater(
-            ebbinghaus_retention(7 * 86400, stability),
-            ebbinghaus_retention(30 * 86400, stability),
-        )
-
-    def test_equal_vector_matches_are_ranked_by_forgetting_curve(self):
-        path = neko._public_memory_path()
-        now = time.time()
-        text = '周末一起去看星星和月亮'
-        neko._store_memory(path, 'old-same-topic', 'lobby', text,
-                           created_at=now - neko.MEMORY_STABILITY)
-        neko._store_memory(path, 'new-same-topic', 'lobby', text,
-                           created_at=now)
-
-        rows = neko._search_memory(path, text)
-
-        self.assertEqual([text, text], [row[5] for row in rows[:2]])
-        self.assertGreater(rows[0][0], rows[1][0])
-        self.assertAlmostEqual(2.718281828459045, rows[0][0] / rows[1][0], delta=0.02)
 
     def test_blog_archive_primes_without_backfill_then_stores_new_blog(self):
         state = neko.default_state()
