@@ -131,10 +131,10 @@ neko.py（入口与兼容 API）
 ```
 main()                      死循环，每 POLL_INTERVAL 一轮
 ├── poll_chat()             每轮最先跑，避免点名排在其它通道的处理之后
-│   ├── fetch_lobby_context()     GET .../lobby/messages?limit=30（聊天上下文）
-│   ├── fetch_lobby_new()         GET .../lobby/messages?after=<游标>（增量）
+│   ├── fetch_lobby_new()         GET .../lobby/messages?after=<游标>（先取增量）
+│   ├── fetch_lobby_context()     只有发现增量后才取最近 30 条（聊天上下文）
 │   ├── merge_timeline()          合成一条按 id 排序的时间线
-│   └── handle_chat_message()     正文点名快速判定 → 读图/生成 → 认领 → 发送；普通消息再掷骰
+│   └── handle_chat_message()     判定 → 掷骰 → 读图/生成 → 认领 → 发送
 ├── poll_direct()           每 DM_POLL_INTERVAL 跑一次
 │   ├── fetch_channel_list()      GET /api/chat/poll（会话列表 + last_message.id）
 │   ├── fetch_channel_new()       只拉有新消息的私聊会话
@@ -428,7 +428,7 @@ bot 的发言，她也能知道自己刚回过什么，避免把同一答案原�
 
 | 文件 | 说明 |
 | --- | --- |
-| `neko.py` | 可执行入口与旧函数 API 的兼容门面 |
+| `neko.py` | 可执行入口与旧函数 API 的兼容门面；轮询编排委托给 `neko_bot/polling.py` |
 | `neko_bot/settings.py` / `prompts.py` | 环境配置与人格提示词 |
 | `neko_bot/api.py` / `site.py` / `llm.py` | HTTP 会话、站点数据及模型访问 |
 | `neko_bot/policy.py` / `vision.py` | 回复触发策略及图片预处理 |
@@ -440,6 +440,7 @@ bot 的发言，她也能知道自己刚回过什么，避免把同一答案原�
 | `neko_memory/` | 旧 JSONL 原始归档（保留但不再作为主检索源，不入 Git） |
 | `neko_memory_db/public.sqlite3` | 大区消息 + 启用后新博客标题/引言（不入 Git） |
 | `neko_memory_db/private/*.sqlite3` | 按私聊对端物理分离的私人记忆库（不入 Git） |
+| `.memory_archive/` | 已清理公共记忆及旧混合归档的本地备份（不入 Git） |
 | `neko_run.log` / `neko_autostart.log` | launcher 落下的运行日志（不入库 / 在上一级目录） |
 
 > 接口契约以站点仓库的 `docs/` 为准（“若与源码不符以源码为准”）；本 README 只解释**实现原理**。

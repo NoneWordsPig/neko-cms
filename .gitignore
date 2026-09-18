@@ -13,6 +13,11 @@ neko_memory_db/
 neko_memory_db.dryrun/
 _test_memory_db/
 _test_memory_json/
+.memory_archive/
+neko_memory*.jsonl
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Python 缓存
 __pycache__/

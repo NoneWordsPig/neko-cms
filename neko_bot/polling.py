@@ -23,7 +23,7 @@ class PollingService:
         d = self.d
         comments = d.fetch_recent_comments()
         if not comments:
-            print('站上还没有评论喵。')
+            print('没有新内容。')
             return
         newest = comments[0]['id']
         if state['last_comment_id'] is None:
@@ -33,13 +33,13 @@ class PollingService:
                     d.handle_comment(state, comment)
             else:
                 print(f'第一次跑：先记住最新评论 {newest}，历史评论不回补喵。')
+                print('没有新内容。')
             state['last_comment_id'] = newest
             d.save_state(state)
             return
         batch = self.select_new_comments(comments, state['last_comment_id'])
         if not batch:
-            print(f'暂无新评论喵。最近一次评论id：{newest}')
-            state['last_comment_id'] = newest
+            print('没有新内容。')
             return
         for comment in batch:
             d.handle_comment(state, comment)
@@ -134,8 +134,8 @@ class PollingService:
 
     def lobby(self, state):
         d = self.d
-        context = d.fetch_lobby_context()
         if state['last_chat_id'] is None:
+            context = d.fetch_lobby_context()
             if context and d.REPLAY_BACKLOG:
                 print('演习模式：把聊天区最近一页拿来看一遍喵。')
                 for message in context:
@@ -144,10 +144,17 @@ class PollingService:
                 print(f"第一次跑：先记住聊天区最新消息 #{context[-1]['id']}，历史消息不回补喵。")
                 state['last_chat_id'] = context[-1]['id']
                 d.save_state(state)
+                if not d.REPLAY_BACKLOG:
+                    print('没有新内容。')
+            else:
+                print('没有新内容。')
             return
         messages = d.fetch_lobby_new(state['last_chat_id'])
         if not messages:
+            print('没有新内容。')
             return
+        # 只有发现增量后才读取上下文；无新消息时不再反复读取最近 30 条。
+        context = d.fetch_lobby_context()
         for message in messages:
             d.archive_public_message(message)
         timeline = d.merge_timeline(context, messages)
@@ -157,15 +164,6 @@ class PollingService:
         )
         for _, message in ordered:
             d.handle_chat_message(state, message, timeline)
-        pending = next((
-            index for index, message in enumerate(messages)
-            if d.pending_name_chat_message(state, message)
-        ), None)
-        if pending is None:
-            state['last_chat_id'] = max(message['id'] for message in messages)
-        else:
-            state['last_chat_id'] = (
-                messages[pending - 1]['id'] if pending else state['last_chat_id']
-            )
-            print(f"正文点名消息 #{messages[pending]['id']} 尚未认领，保留聊天游标等待重试喵。")
+        # 不因某条消息暂未回复而回退游标，否则重启/下一轮会反复处理历史消息。
+        state['last_chat_id'] = max(message['id'] for message in messages)
         d.save_state(state)
