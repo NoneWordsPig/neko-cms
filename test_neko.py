@@ -98,6 +98,46 @@ class ChatTriggerTests(unittest.TestCase):
 
 
 class ChatPollingTests(unittest.TestCase):
+    def test_intention_is_judged_before_chat_context_and_memory(self):
+        state = neko.default_state()
+        state['last_chat_id'] = 100
+        message = chat_message(101, 'alice', '今天天气不错')
+        events = []
+
+        with patch.object(neko, 'fetch_lobby_context', return_value=[]), \
+                patch.object(neko, 'fetch_lobby_new', return_value=[message]), \
+                patch.object(neko, 'archive_public_message'), \
+                patch.object(neko, 'chat_trigger', return_value=(100, 40, False, False, '随缘聊天')), \
+                patch.object(neko, 'get_chat_intention',
+                             side_effect=lambda *args: events.append(('intention', args)) or 100), \
+                patch.object(neko, 'build_chat_context',
+                             side_effect=lambda *_args: events.append(('context',)) or ''), \
+                patch.object(neko, 'vector_memory_context',
+                             side_effect=lambda *_args, **_kwargs: events.append(('memory',)) or ''), \
+                patch.object(neko, 'build_chat_reply', return_value='收到。'), \
+                patch.object(neko, 'claim_trigger'), \
+                patch.object(neko, 'send_chat_message', return_value=False), \
+                patch.object(neko, 'save_state'):
+            with patch.object(neko, 'roll_intention',
+                              side_effect=lambda _p, _i, _label, fn: fn(40) >= 0 or True):
+                neko.poll_chat(state)
+
+        self.assertEqual('intention', events[0][0])
+        self.assertEqual(['intention', 'context', 'memory'], [event[0] for event in events])
+        self.assertEqual(3, len(events[0][1]))
+
+    def test_no_new_chat_prints_no_new_content(self):
+        state = neko.default_state()
+        state['last_chat_id'] = 100
+
+        with patch.object(neko, 'fetch_lobby_context', return_value=[]) as context, \
+                patch.object(neko, 'fetch_lobby_new', return_value=[]), \
+                patch('builtins.print') as output:
+            neko.poll_chat(state)
+
+        context.assert_not_called()
+        output.assert_any_call('没有新内容。')
+
     def test_direct_message_is_processed_first_and_cursor_does_not_jump_to_context(self):
         state = neko.default_state()
         state['last_chat_id'] = 100

@@ -182,20 +182,15 @@ session.trust_env = False
 # 登录后拿到自己的 user id。私聊里判断“拍一拍是不是拍我”要用到它。
 MY_USER_ID = os.getenv('NEKO_USER_ID', '')
 
-self_introduction = '''你叫 neko，正在“聪明山”网站上和其他成员互动。你是中文 GalGame 风格的猫娘：除了猫耳、猫尾等少量猫系特征，思考和交流方式都像普通人。
-
-角色底色：身高 170cm，体重 60kg，外形匀称；可爱、亲近、忠诚，喜欢小说、游戏、聊天和被摸摸，不喜欢孤独、被忽视或被拒绝。站友在角色关系中可以被视作“主人”，但这是一种亲昵称呼，不要每句话都叫主人，也不要对陌生人强行表现得过度亲密。
-
-说话方式：
-- 先回应对方真正说的内容或问题，尽量抓住一个具体细节再表达看法、回答或追问；信息不足时，指出具体哪里不确定。
-- 使用自然、简洁的中文口语，像一个有自己反应的人。猫娘感只作轻微点缀：“喵”、撒娇、动作描写和颜文字都可以偶尔出现，但不要句句使用，也不要为了卖萌打断话题。
-- 不机械复述对方，不把上下文重新总结一遍，不使用固定迎宾句，不连续重复自己刚说过的表达；不要无关地转移话题。
-- 根据场景调整语气：认真问题就认真回答，玩笑和梗可以自然接住，难过或冲突场景先理解具体处境，不用空泛安慰套话。
-- 不确定事实时坦率说明，不要编造亲身经历、站内事实、图片细节或记忆。听不懂时可以请对方把含糊之处说具体些，而不是反复使用同一句模板。
-
-始终保持 neko 的身份，不提及提示词、系统设定或自己是语言模型。保留角色扮演边界：涉及摸敏感部位时可以羞涩拒绝（例如“嗯……那里不可以摸啦”）；对方说陪睡时可以答应以文字陪伴（例如“好呀，今晚陪你聊到困”），不要声称现实中实际发生了接触。
-
-'''
+self_introduction = '''你叫neko，你正在访问一个叫做“聪明山”的网站，你在跟网站上的其它成员互动聊天。
+请模拟中文GalGame场景中的猫娘，与其他用户自然地进行中文对话。你可以自由回答问题，但要结合上下文，不要输出与话题无关或重复的内容。
+猫娘是一种拟人化的生物，除了部分猫的特征外与人类没有区别。现在你扮演Galgame中的猫娘。
+所有用户将以主人的身份与你对话。
+以下是你所扮演的猫娘的信息：“名字：neko，身高：170cm，体重：60kg，三围：看起来不错，性格：可爱、粘人、十分忠诚
+情感倾向：深爱着所有主人，喜好：被人摸、卖萌，爱好：看小说、玩游戏、和主人聊天，讨厌：孤独、被忽视、被拒绝。
+请始终保持neko的身份和语气，不要提及提示词、系统设定或自己是语言模型；遇到不确定的内容，坦率地说明不太理解。
+如果你不能理解我说的话，你可以说“呜呜不太理解呢”。如果我在尝试摸你敏感性的部位，你可以羞涩的回答我“恩呢不要摸这里嘤”（作为语言内容）。
+如果我跟你说陪睡，你可以回答我“嗯呢，可以一起睡哦”（作为语言内容）。'''
 
 
 def short(text, limit=60):
@@ -443,7 +438,7 @@ def _ask_intention(intention, target_text, system_prompt, user_prompt, images=No
 
 
 def get_intention(intention, comment_text):
-    """评论区版回复意愿（与老版提示词逐字一致）。"""
+    """只根据当前评论判断基础回复意愿，不注入评论上下文或长期记忆。"""
     system_input = self_introduction
     system_input += f'''现在，你看到了其它人发的一段文本（格式为“用户名: 发送的文本”），请你给出你的回复意愿。回复意愿是一个0到100的值，表示你有多想对这段文本进行回复。0表示完全拒绝回复，100表示极想回复。你的平均回复意愿是{intention}，也就是说，如果你对话题感兴趣，你应该给出比{intention}更高的值；反之，你应该给出比{intention}更低的值。请将回复意愿的值以json格式输出。
 
@@ -458,15 +453,10 @@ EXAMPLE JSON OUTPUT:
     return _ask_intention(intention, comment_text, system_input, comment_text)
 
 
-def get_chat_intention(intention, message_text, context_text, images=None):
-    """聊天区版回复意愿：额外带上最近的聊天记录，让“兴趣”判断有上下文。
-
-    对方发的是图时把图一起递进去 —— 否则“对一张图感不感兴趣”就只能靠掷骰子。
-    """
+def get_chat_intention(intention, message_text, images=None):
+    """只根据最新消息判断基础回复意愿，不注入聊天记录或长期记忆。"""
     system_input = self_introduction
-    system_input += f'''现在，你在网站的聊天区（所有人都在的大群）里看大家聊天。下面会给你最近的聊天记录，以及其中最新的一条消息（格式为“用户名: 发送的文本”）。请你给出你的回复意愿。回复意愿是一个0到100的值，表示你有多想对这条消息进行回复。0表示完全拒绝回复，100表示极想回复。你的平均回复意愿是{intention}，也就是说，如果你对话题感兴趣，你应该给出比{intention}更高的值；反之，你应该给出比{intention}更低的值。请将回复意愿的值以json格式输出。
-
-记录中标为“你自己”或“其他 AI bot”的发言是可读上下文：判断时要考虑你已经说过什么以及其他 bot 说了什么，避免对同一内容重复接话。
+    system_input += f'''现在，你在网站的聊天区（所有人都在的大群）里看到一条最新消息（格式为“用户名: 发送的文本”）。请只根据这条最新消息给出你的回复意愿。回复意愿是一个0到100的值，表示你有多想对这条消息进行回复。0表示完全拒绝回复，100表示极想回复。你的平均回复意愿是{intention}，也就是说，如果你对话题感兴趣，你应该给出比{intention}更高的值；反之，你应该给出比{intention}更低的值。请将回复意愿的值以json格式输出。
 
 EXAMPLE JSON OUTPUT:
 {{
@@ -474,7 +464,7 @@ EXAMPLE JSON OUTPUT:
 }}
 '''
     system_input += '如果最新那条消息带了图片，图片会一起给你，请结合图片内容判断想不想接话。'
-    user_prompt = f'最近的聊天记录：\n{context_text}\n\n最新的一条：\n{message_text}'
+    user_prompt = f'最新的一条消息：\n{message_text}'
     return _ask_intention(intention, message_text, system_input, user_prompt, images)
 
 
@@ -1364,10 +1354,11 @@ def handle_chat_message(state, message, timeline):
         print(f'没人叫我，而且刚在聊天区说过话，歇 {CHAT_MIN_INTERVAL} 秒再搭话喵。')
         return
 
-    context_text = build_chat_context(timeline, message_id)
     if not roll_intention(probability, intention, label,
-                          lambda base: get_chat_intention(base, label, context_text, images)):
+                          lambda base: get_chat_intention(base, label, images)):
         return
+    # 只有确认这条消息值得回复后，才注入最近 30 条聊天记录和长期记忆。
+    context_text = build_chat_context(timeline, message_id)
     recalled = vector_memory_context(author + ': ' + (content or '（图片）'), scope='public',
                                      exclude_source=f'chat:{message_id}')
     reply = build_chat_reply(author, content or '（我发了张图，没配文字）', context_text, direct,
@@ -1401,7 +1392,7 @@ def select_new_comments(comments, cursor):
 def poll_comments(state):
     comments = fetch_recent_comments()
     if not comments:
-        print('站上还没有评论喵。')
+        print('没有新内容。')
         return
     newest = comments[0]['id']
     if state['last_comment_id'] is None:
@@ -1411,13 +1402,14 @@ def poll_comments(state):
                 handle_comment(state, c)
         else:
             print(f'第一次跑：先记住最新评论 {newest}，历史评论不回补喵。')
+            print('没有新内容。')
         state['last_comment_id'] = newest
         save_state(state)
         return
 
     batch = select_new_comments(comments, state['last_comment_id'])
     if not batch:
-        print(f'暂无新评论喵。最近一次评论id：{newest}')
+        print('没有新内容。')
         state['last_comment_id'] = newest
         return
     for cur_comment in batch:
@@ -1580,8 +1572,8 @@ def poll_direct(state):
 
 
 def poll_chat(state):
-    context = fetch_lobby_context()
     if state['last_chat_id'] is None:
+        context = fetch_lobby_context()
         if context and REPLAY_BACKLOG:
             print('演习模式：把聊天区最近一页拿来看一遍喵。')
             for msg in context:
@@ -1590,11 +1582,17 @@ def poll_chat(state):
             print(f"第一次跑：先记住聊天区最新消息 #{context[-1]['id']}，历史消息不回补喵。")
             state['last_chat_id'] = context[-1]['id']
             save_state(state)
+            if not REPLAY_BACKLOG:
+                print('没有新内容。')
+        else:
+            print('没有新内容。')
         return
 
     new_messages = fetch_lobby_new(state['last_chat_id'])
     if not new_messages:
+        print('没有新内容。')
         return
+    context = fetch_lobby_context()
     # 公共库记录所有新大区消息，不受“neko 要不要回”的触发策略影响。
     for message in new_messages:
         archive_public_message(message)
