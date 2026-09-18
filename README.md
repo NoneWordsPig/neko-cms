@@ -225,7 +225,7 @@ main()                      死循环，每 POLL_INTERVAL 一轮
 
 ### 7. “想不想回”是问模型要一个数
 
-`deepseek-chat` + `response_format=json_object` → `{"intention": 0~100}`，再和随机数比较。
+`deepseek-flash` + `response_format=json_object` → `{"intention": 0~100}`，再和随机数比较。
 提示词 = 人格设定（`self_introduction`）+ 场景说明 + JSON 输出示例（两处场景：
 评论区 / 聊天区）。回复意愿判断只看当前这条新消息，不注入长期记忆或最近 30 条聊天记录；
 只有确认要回复后，生成回复时才注入评论上下文、最近 30 条聊天记录和向量记忆。
@@ -266,9 +266,7 @@ main()                      死循环，每 POLL_INTERVAL 一轮
   `json` 字样（DeepSeek 的硬性要求），所以两个意愿提示词里的 `EXAMPLE JSON OUTPUT` 不能删；
 - 单图 prompt 约 200~300 token（768 见方的 JPEG 编码后约 20~50 KB）。
 
-**模型选型**：`deepseek-chat` 能看图——GIF 抽帧、905×2000 长截图 OCR 都实测过
-（截图里的金额、用户名逐字读对）；不换模型反而更稳妥，因为 `deepseek-v4-pro`
-会直接答“无法查看图片”。所以这里没有引入第二个模型。
+**模型选型**：当前使用中转站提供的 `deepseek-flash`，图片通过 OpenAI 兼容接口发送。
 
 **隐私与降级**：图只在本机内存里过一遍（下载 → 缩放 → base64 → 随请求发出去），
 **不落盘、不转发、不回传站上**；`NEKO_VISION=0` 可随时关掉，机器上没装 Pillow 时

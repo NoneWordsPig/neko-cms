@@ -133,8 +133,7 @@ DM_CURSOR_KEEP = 200            # 最多记多少个私聊会话的游标
 
 # ── 聊天区读图（vision）──
 # 走的是 DeepSeek 的 OpenAI 兼容口：content 里塞 {"type":"image_url"} 的 data URL。
-# 实测 deepseek-chat 能看图（含 GIF 抽帧、长截图 OCR）；deepseek-v4-pro 不行，
-# 所以这里不换模型，继续用 deepseek-chat。
+# 当前中转站使用 deepseek-flash；图片仍通过 OpenAI 兼容接口传递。
 VISION_ENABLED = SETTINGS.vision_enabled
 IMAGE_MAX_BYTES = 8 * 1024 * 1024      # 站点单图上限 10MB；再大就不看了
 IMAGE_MAX_DIM = 768                    # 长边缩到这个尺寸，单图 prompt 约 200~300 token
@@ -171,7 +170,7 @@ EMBEDDING_MODEL = SETTINGS.embedding_model
 API_KEY = SETTINGS.api_key   # .env 里写的是小写 api_key
 client = OpenAI(
     api_key=API_KEY,
-    base_url='https://api.deepseek.com'
+    base_url='https://surplustoken.com/v1'
 )
 embedding_client = (
     OpenAI(api_key=EMBEDDING_API_KEY, base_url=EMBEDDING_BASE_URL)

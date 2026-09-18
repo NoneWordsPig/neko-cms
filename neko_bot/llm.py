@@ -4,7 +4,7 @@ import re
 
 
 class ChatModel:
-    def __init__(self, client, model='deepseek-chat'):
+    def __init__(self, client, model='deepseek-flash'):
         self.client = client
         self.model = model
 
