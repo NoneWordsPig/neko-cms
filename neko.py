@@ -119,7 +119,8 @@ CHAT_AMBIENT_PROBABILITY = 25
 CHAT_AMBIENT_INTENTION = 50
 
 CHAT_CONTEXT_LIMIT = 30         # 给模型看的最近聊天条数
-CHAT_FETCH_LIMIT = 100          # 单次拉取上限（接口上限就是 100）
+CHAT_FETCH_LIMIT = 30           # 聊天区单次最多拉取的增量条数
+CHAT_NEW_WINDOW_SECONDS = 30    # 聊天区只处理最近 30 秒内的新消息
 
 BLOG_FULL_MAX_CHARS = 4000      # 博客正文短于这个就整篇读
 BLOG_SUMMARY_INPUT_CHARS = 20000  # 概括时最多喂给模型的正文长度
@@ -301,7 +302,7 @@ def fetch_channel_latest(channel_id, limit=CHAT_CONTEXT_LIMIT):
     return _site_repository().channel_latest(channel_id, limit)
 
 
-def fetch_channel_new(channel_id, after_id, limit=CHAT_FETCH_LIMIT, max_pages=5):
+def fetch_channel_new(channel_id, after_id, limit=100, max_pages=5):
     return _site_repository().channel_new(channel_id, after_id, limit, max_pages)
 
 
@@ -328,7 +329,8 @@ def fetch_lobby_context():
 
 
 def fetch_lobby_new(after_id):
-    return fetch_channel_new(LOBBY, after_id)
+    # 聊天区只拉一页，避免一次轮询追赶过多积压消息。
+    return fetch_channel_new(LOBBY, after_id, limit=CHAT_FETCH_LIMIT, max_pages=1)
 
 
 def fetch_channel_list():
@@ -737,6 +739,15 @@ def _message_time(message):
         except (TypeError, ValueError):
             continue
     return time.time()
+
+
+def is_recent_chat_message(message, now=None):
+    """判断聊天消息是否仍在本轮允许处理的 30 秒窗口内。"""
+    if not message.get('created_at'):
+        # 测试数据或异常响应缺少时间戳时保留原有行为；正常接口始终会返回它。
+        return True
+    now = time.time() if now is None else now
+    return now - _message_time(message) <= CHAT_NEW_WINDOW_SECONDS
 
 
 def _message_memory_text(message):

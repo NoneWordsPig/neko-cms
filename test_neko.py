@@ -156,6 +156,30 @@ class ChatPollingTests(unittest.TestCase):
         self.assertEqual([102, 101], handled)
         self.assertEqual(102, state['last_chat_id'])
 
+    def test_lobby_skips_messages_older_than_thirty_seconds(self):
+        state = neko.default_state()
+        state['last_chat_id'] = 100
+        old = chat_message(
+            101, 'alice', '@neko 过期消息',
+            created_at=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() - 45)),
+        )
+        fresh = chat_message(
+            102, 'bob', '@neko 新消息',
+            created_at=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+        )
+        handled = []
+
+        with patch.object(neko, 'fetch_lobby_context', return_value=[fresh]), \
+                patch.object(neko, 'fetch_lobby_new', return_value=[old, fresh]), \
+                patch.object(neko, 'archive_public_message'), \
+                patch.object(neko, 'handle_chat_message',
+                             side_effect=lambda _s, m, _t: handled.append(m['id'])), \
+                patch.object(neko, 'save_state'):
+            neko.poll_chat(state)
+
+        self.assertEqual([102], handled)
+        self.assertEqual(102, state['last_chat_id'])
+
     def test_private_history_walks_backwards_until_the_first_message(self):
         latest = [chat_message(i, 'alice', str(i)) for i in range(101, 201)]
         older = [chat_message(i, 'alice', str(i)) for i in range(1, 101)]

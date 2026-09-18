@@ -153,17 +153,27 @@ class PollingService:
         if not messages:
             print('没有新内容。')
             return
+        # after 只按 id 追赶；过期消息不能继续进入处理队列，否则积压时会把旧话
+        # 当成新话逐条处理。无论是否过期，都推进已经拉到的最大 id，避免反复拉取。
+        recent_messages = [message for message in messages
+                           if d.is_recent_chat_message(message)]
+        newest_id = max(message['id'] for message in messages)
+        if not recent_messages:
+            state['last_chat_id'] = newest_id
+            d.save_state(state)
+            print('最近 30 秒内没有新内容。')
+            return
         # 只有发现增量后才读取上下文；无新消息时不再反复读取最近 30 条。
         context = d.fetch_lobby_context()
-        for message in messages:
+        for message in recent_messages:
             d.archive_public_message(message)
-        timeline = d.merge_timeline(context, messages)
+        timeline = d.merge_timeline(context, recent_messages)
         ordered = sorted(
-            enumerate(messages),
+            enumerate(recent_messages),
             key=lambda pair: (d.chat_message_priority(pair[1], timeline), pair[0]),
         )
         for _, message in ordered:
             d.handle_chat_message(state, message, timeline)
         # 不因某条消息暂未回复而回退游标，否则重启/下一轮会反复处理历史消息。
-        state['last_chat_id'] = max(message['id'] for message in messages)
+        state['last_chat_id'] = newest_id
         d.save_state(state)
